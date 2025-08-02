@@ -1,125 +1,125 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+import torch
+import torch.nn as nn
+import torch.optim as optim
 import numpy as np
 
 app = FastAPI()
 
-# Add CORS middleware
+# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Change this to restrict origins
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ----- Network Class -----
-class DynamicNeuralNet:
-    def __init__(self, input_size, hidden_layers, output_size, lr=0.01, decay=0.0):
-        self.layers = [input_size] + hidden_layers + [output_size]
-        self.lr = lr
-        self.decay = decay
-        self.epoch = 0
-        self.init_params()
+# -------- Model Definition --------
+class PINN(nn.Module):
+    def __init__(self, input_dim, hidden_layers, output_dim):
+        super().__init__()
+        layers = []
+        prev_dim = input_dim
+        self.weight_layers = []
+        self.bias_layers = []
+        for h in hidden_layers:
+            linear = nn.Linear(prev_dim, h)
+            layers.append(linear)
+            layers.append(nn.Tanh())
+            self.weight_layers.append(linear.weight)
+            self.bias_layers.append(linear.bias)
+            prev_dim = h
+        final = nn.Linear(prev_dim, output_dim)
+        layers.append(final)
+        self.weight_layers.append(final.weight)
+        self.bias_layers.append(final.bias)
+        self.net = nn.Sequential(*layers)
 
-    def init_params(self):
-        self.weights = []
-        self.biases = []
-        for i in range(len(self.layers) - 1):
-            w = np.random.randn(self.layers[i], self.layers[i+1]) * np.sqrt(2 / self.layers[i])
-            b = np.zeros((1, self.layers[i+1]))
-            self.weights.append(w)
-            self.biases.append(b)
+    def forward(self, x):
+        return self.net(x)
 
-    def sigmoid(self, x): return 1 / (1 + np.exp(-x))
-    def sigmoid_deriv(self, x): return x * (1 - x)
+def pde_residual(model, x, decay_lambda):
+    x.requires_grad_(True)
+    u = model(x)
+    du_dt = torch.autograd.grad(
+        u, x,
+        grad_outputs=torch.ones_like(u),
+        create_graph=True
+    )[0]
+    residual = du_dt + decay_lambda * u
+    return residual
 
-    def forward(self, X):
-        activations = [X]
-        for w, b in zip(self.weights, self.biases):
-            z = np.dot(activations[-1], w) + b
-            a = self.sigmoid(z)
-            activations.append(a)
-        return activations
-
-    def backward(self, activations, y_true):
-        grads_w = [0] * len(self.weights)
-        grads_b = [0] * len(self.biases)
-
-        error = activations[-1] - y_true
-        delta = error * self.sigmoid_deriv(activations[-1])
-
-        for i in reversed(range(len(self.weights))):
-            grads_w[i] = np.dot(activations[i].T, delta)
-            grads_b[i] = np.sum(delta, axis=0, keepdims=True)
-            if i != 0:
-                delta = np.dot(delta, self.weights[i].T) * self.sigmoid_deriv(activations[i])
-
-        # learning rate decay
-        lr = self.lr * (1.0 / (1.0 + self.decay * self.epoch))
-        for i in range(len(self.weights)):
-            self.weights[i] -= lr * grads_w[i]
-            self.biases[i] -= lr * grads_b[i]
-
-    def train(self, X, y, epochs):
-        history = []
-        for _ in range(epochs):
-            activations = self.forward(X)
-            loss = np.mean((y - activations[-1]) ** 2)
-            self.backward(activations, y)
-            self.epoch += 1
-            history.append(float(loss))
-        return history
-
-    def predict(self, X):
-        return self.forward(X)[-1]
-
-    def get_params(self):
-        return {
-            "weights": [w.tolist() for w in self.weights],
-            "biases": [b.tolist() for b in self.biases],
-        }
-
-# -------- API Schema --------
-
-class TrainRequest(BaseModel):
+# -------- Request Schema --------
+class TrainPINNRequest(BaseModel):
     inputs: list[list[float]]
     targets: list[list[float]]
+    inputs_collocation: list[list[float]]
     hidden_layers: list[int]
     epochs: int
     learning_rate: float
-    decay: float
+    decay: float = 0.0
+    lambda_pde: float = 1.0
     previous_params: dict | None = None
 
-# -------- API Logic --------
-
+# -------- Training Endpoint --------
 @app.post("/train")
-def train_model(req: TrainRequest):
-    X = np.array(req.inputs)
-    y = np.array(req.targets)
+def train_pinn(req: TrainPINNRequest):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Initialize network
-    network = DynamicNeuralNet(
-        input_size=X.shape[1],
-        hidden_layers=req.hidden_layers,
-        output_size=y.shape[1],
-        lr=req.learning_rate,
-        decay=req.decay,
-    )
+    X_data = torch.tensor(req.inputs, dtype=torch.float32, device=device)
+    y_data = torch.tensor(req.targets, dtype=torch.float32, device=device)
+    X_colloc = torch.tensor(req.inputs_collocation, dtype=torch.float32, device=device)
 
-    # Inject previous weights/biases if provided
+    input_dim = X_data.shape[1]
+    output_dim = y_data.shape[1]
+    model = PINN(input_dim, req.hidden_layers, output_dim).to(device)
+
     if req.previous_params:
-        network.weights = [np.array(w) for w in req.previous_params["weights"]]
-        network.biases = [np.array(b) for b in req.previous_params["biases"]]
+        with torch.no_grad():
+            weights = req.previous_params.get("weights", [])
+            biases = req.previous_params.get("biases", [])
+            for param, w in zip(model.weight_layers, weights):
+                param.copy_(torch.tensor(w, dtype=torch.float32, device=device))
+            for param, b in zip(model.bias_layers, biases):
+                param.copy_(torch.tensor(b, dtype=torch.float32, device=device))
 
-    # Train the network
-    losses = network.train(X, y, req.epochs)
-    prediction = network.predict(X).tolist()
+    optimizer = optim.Adam(model.parameters(), lr=req.learning_rate)
+    scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=1.0 / (1.0 + req.decay))
+    mse = nn.MSELoss()
+    losses = []
+
+    for epoch in range(req.epochs):
+        model.train()
+        optimizer.zero_grad()
+
+        y_pred = model(X_data)
+        data_loss = mse(y_pred, y_data)
+
+        residual = pde_residual(model, X_colloc, req.lambda_pde)
+        physics_loss = mse(residual, torch.zeros_like(residual))
+
+        loss = data_loss + req.lambda_pde * physics_loss
+        loss.backward()
+        optimizer.step()
+        scheduler.step()
+        losses.append(float(loss.item()))
+
+    model.eval()
+    with torch.no_grad():
+        prediction = model(X_data).cpu().numpy().tolist()
+        weights = [param.detach().cpu().numpy().tolist() for param in model.weight_layers]
+        biases = [param.detach().cpu().numpy().tolist() for param in model.bias_layers]
+
     return {
         "losses": losses,
         "prediction": prediction,
-        "params": network.get_params(),
+        "params": {
+            "weights": weights,
+            "biases": biases
+        }
     }
 
 @app.get("/ping")
